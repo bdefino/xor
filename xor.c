@@ -22,6 +22,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -39,7 +40,6 @@ include:
 	is ever in primary storage (excluding caching and STDOUT)
 *//************************************************
 - buflen option?
-- change to bitwise utility?
 - internal offset options?
 *************************************************/
 
@@ -75,7 +75,14 @@ include:
 
 #undef XOR_FLAG_LONGEST
 
-#define XOR_FLAG_LONGEST	0x1
+#define XOR_FLAG_LONGEST		0x1
+
+struct wrapstat {
+	uint8_t		fifolike;
+	uint8_t		hiteof;
+	off_t		offset;
+	struct stat	stat;
+};
 
 extern int	errno;
 void *(* volatile memshred)(void *, int, size_t) = &memset;
@@ -199,20 +206,21 @@ usage(const char *name)
 	fprintf(stderr, USAGE, name);
 }
 
+static int
+wrapstat_init(struct wrapstat *dest, int ifd);
+
 int
 xor(int ofd, int flags, const int *ifds, size_t n)
 {
-	size_t			eofsleft;
-	size_t			i;
-	ssize_t			iobuflen;
-	struct stat		istat;
-	struct xoristat {
-		uint8_t		fifolike;
-		uint8_t		hiteof;
-	}			*istats;
-	uint8_t			octet;
-	int			retval;
-	uint8_t			xored;
+	size_t		eofsleft;
+	size_t		i;
+	ssize_t		iobuflen;
+	struct wrapstat	*istats;
+	uint8_t		octet;
+	uint8_t		output;
+	int		retval;
+	int		selected;
+	fd_set		selectfds;
 
 	retval = 0;
 
@@ -234,61 +242,98 @@ xor(int ofd, int flags, const int *ifds, size_t n)
 		}
 	}
 
-	/* XOR */
+	/* initialize input statuses */
 
-	istats = (struct xoristat *) calloc(1, n * sizeof(struct xoristat));
+	istats = (struct wrapstat *) calloc(1, n * sizeof(struct wrapstat));
 
 	for (i = 0; i < n; i++) {
-		if (fstat(ifds[i], &istat)) {
-			retval = -errno;
+		retval = wrapstat_init(istats + i, ifds[i]);
+
+		if (retval) {
 			goto bubble;
 		}
-		istats[i].fifolike = !S_ISBLK(istat.st_mode)
-			&& !S_ISDIR(istat.st_mode) && !S_ISREG(istat.st_mode);
 	}
+
+	/* XOR */
+
+	FD_ZERO(&selectfds);
 
 	for (eofsleft = n; eofsleft > 0; ) {
 		/* XOR the next collection of octets */
 
-		xored = 0;
+		output = 0;
 
-		for (i = 0; i < n; i++, xored ^= octet) {
+		for (i = 0; i < n; i++) {
+read:
 			/* read an octet */
 
 			iobuflen = read(ifds[i], &octet, sizeof(octet));
 
-			if (iobuflen < 0 || istats[i].fifolike) {
-				retval = -errno;
-				goto bubble;
-			} else if (iobuflen) {
+			if (iobuflen == sizeof(octet)) {
+				output ^= octet;
 				continue;
-			} else if (!iobuflen && !(flags & XOR_FLAG_LONGEST)) {
-				/* stop */
+			} else if (iobuflen) {
+				/* short count (infeasible for most systems) */
 
+				retval = errno ? -errno : -EIO;
 				goto bubble;
+			} else if (!(flags & XOR_FLAG_LONGEST)) {
+				/* short-circuit */
+
+				eofsleft = 0;
+				break;
+			} else if (istats[i].fifolike) {
+select:
+				/* select */
+
+				FD_SET(ifds[i], &selectfds);
+				selected = select(1, &selectfds, NULL, NULL,
+					NULL);
+
+				if (selected < 1) {
+					retval = errno ? -errno : -EIO;
+					goto bubble;
+				} else if (!selected) {
+					/* repeat */
+
+					goto select;
+				}
+				FD_CLR(ifds[i], &selectfds);
+
+				/* reread */
+
+				goto read;
 			}
 
-			/* EOF, and not FIFO-like: wrap around */
+			/* wrap around */
 
-			if (lseek(ifds[i], 0, SEEK_SET) < 0) {
-				retval = -errno;
-				goto bubble;
-			}
-			iobuflen = read(ifds[i], &octet, sizeof(octet));
-
-			if (iobuflen != sizeof(octet)) {
-				retval = -errno;
+			if (lseek(ifds[i], istats[i].offset, SEEK_SET) < 0) {
+				retval = errno ? -errno : -EIO;
 				goto bubble;
 			}
 			eofsleft -= istats[i].hiteof ? 0 : 1;
 			istats[i].hiteof = ~0;
+
+			if (!eofsleft) {
+				/* short-circuit */
+
+				break;
+			}
+
+			/* reread */
+
+			goto read;
 		}
 
 		if (!eofsleft) {
+			/* short-circuit */
+
 			break;
 		}
 
-		if (write(ofd, &xored, sizeof(xored)) != sizeof(xored)) {
+		/* write the output */
+
+		if (write(ofd, &output, sizeof(output)) != sizeof(output)) {
 			retval = errno ? -errno : -EIO;
 			goto bubble;
 		}
@@ -296,11 +341,31 @@ xor(int ofd, int flags, const int *ifds, size_t n)
 bubble:
 	/* shred cryptographic remnants */
 
-	memshred(&xored, '\0', sizeof(xored));
+	memshred(&output, '\0', sizeof(output));
 	memshred(&octet, '\0', sizeof(octet));
 
-	memshred(istats, '\0', n * sizeof(struct xoristat));
+	memshred(istats, '\0', n * sizeof(struct wrapstat));
 	free(istats);
 	return retval;
+}
+
+static int
+wrapstat_init(struct wrapstat *dest, int fd)
+{
+	if (dest == NULL) {
+		return -EFAULT;
+	} else if (fd < 0) {
+		return -EBADF;
+	}
+
+	if (fstat(fd, &dest->stat)) {
+		return -errno;
+	}
+	dest->fifolike = S_ISCHR(dest->stat.st_mode)
+		|| S_ISFIFO(dest->stat.st_mode)
+		|| S_ISSOCK(dest->stat.st_mode);
+	dest->hiteof = 0;
+	dest->offset = lseek(fd, 0, SEEK_CUR);
+	return 0;
 }
 

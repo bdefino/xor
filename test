@@ -1,27 +1,65 @@
 #!/usr/bin/env sh
+# test `xor` (requires `make`)
+CTEXT=
+DTEXT=
+KEYS=
+PTEXT=
+XOR=./bin/xor
+
+trap 'rm -f "${CTEXT}" "${DTEXT}" ${KEYS} "${PTEXT}"' ABRT EXIT HUP INT TERM
+
+# build `xor`
+
+make all
+
+# generate the temporary files
+
+CTEXT="$(mktemp ctext-XXXX)"
+DTEXT="$(mktemp dtext-XXXX)"
+KEYS="$(for I in 0 1 2 3 4 5 6 7 8 9
+do
+	mktemp key-XXXX
+done)"
+PTEXT="$(mktemp ptext-XXXX)"
+
 # create a plaintext file
 
-echo "some plaintext" > ptext
+echo "Generating a plaintext (${PTEXT})..."
+dd bs=1 count=128 if=/dev/urandom of="${PTEXT}" > /dev/null 2>&1
 
 # generate random keys (of the same size: if they're too small, the XOR wraps
 # around)
 
-COUNT="$(wc -c ptext | cut -d ' ' -f 1)"
+echo "Generating keys..."
 
-for I in 1 2 3 4
+COUNT="$(wc -c "${PTEXT}" | cut -d ' ' -f 1)"
+
+for KEY in ${KEYS}
 do
-	dd bs=1 count="${COUNT}" if=/dev/urandom of="key${I}"
+	dd bs=1 count="${COUNT}" if=/dev/urandom of="${KEY}" > /dev/null 2>&1
 done
 
 # generate a ciphertext
 
-xor key* ptext > ctext
+echo "Enciphering..."
+! "${XOR}" ${KEYS} "${PTEXT}" > "${CTEXT}" \
+	&& echo "FAILED!" \
+	&& exit 1
 
 # regenerate the plaintext
 
-xor key* ctext > ptext.recovered
+echo "Deciphering..."
+! "${XOR}" ${KEYS} "${CTEXT}" > "${DTEXT}" \
+	&& echo "FAILED!" \
+	&& exit 1
 
 # compare
 
-diff ptext*
+if diff "${DTEXT}" "${PTEXT}" # > /dev/null 2>&1
+then
+	echo "Successfully deciphered ${COUNT} bytes."
+else
+	echo "FAILED!"
+	exit 1
+fi
 
