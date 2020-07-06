@@ -19,34 +19,16 @@ Well, what makes this tool different from the tons of others out there?  Easy:
 Oh, and here's the full help text:
 ```
 securely XOR files to STDOUT
-Usage: xor FILE...
-```
-and an example:
-```
-# create a plaintext file
-
-echo "some plaintext" > ptext
-
-# generate random keys (of the same size: if they're too small, the XOR wraps
-# around)
-
-COUNT="$(wc -c ptext)"
-
-for I in 1 2 3 4
-do
-	dd bs=1 count="${COUNT}" if=/dev/urandom of="key${I}"
-done
-
-# generate a ciphertext
-
-xor key* ptext > ctext
-
-# regenerate the plaintext
-
-xor key* ctext > ptext.recovered
-
-# compare
-
-diff ptext*
+Usage: ./bin/xor FILE...
+FILE
+	path to an input FILE;
+	`-` means STDIN
+OPTIONS
+	-h
+		display this text and exit
+	-l
+		output as many bytes as the longest
+		input; for FIFO-like FILEs, output is
+		infinite)
 ```
 

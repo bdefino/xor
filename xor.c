@@ -17,6 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,60 +37,114 @@ include:
 - input-fueled crashes are prevented (`argc`/`argv` are untrusted),
 - and barring an unknown vulnerability, at most 1 character of each input file
 	is ever in primary storage (excluding caching and STDOUT)
-*/
+*//************************************************
+- buflen option?
+- change to bitwise utility?
+- internal offset options?
+*************************************************/
 
+#undef HELP
+#undef OPTSTRING
+#undef PATH_STDIN
 #undef PREFIX_CALLOC
+#undef PREFIX_GETOPT
 #undef PREFIX_OPEN
 #undef PREFIX_XOR
 #undef USAGE
 
-#define PREFIX_CALLOC		"calloc(3)"
-#define PREFIX_OPEN		"open(2)"
-#define PREFIX_XOR		"xor(0)"
-#define USAGE			("securely XOR files to STDOUT\n" \
-					"Usage: %s FILE...\n")
+#define HELP		("FILE\n" \
+				"\tpath to an input FILE;\n" \
+				"\t`-` means STDIN\n" \
+				"OPTIONS\n" \
+				"\t-h\n" \
+				"\t\tdisplay this text and exit\n" \
+				"\t-l\n" \
+				"\t\toutput as many bytes as the longest\n" \
+				"\t\tinput; for FIFO-like FILEs, output is\n" \
+				"\t\tinfinite)\n")
+#define OPTSTRING	"hl+"
+#define PATH_STDIN	"-"
+#define PREFIX_CALLOC	"calloc(3)"
+#define PREFIX_GETOPT	"getopt(3)"
+#define PREFIX_OPEN	"open(2)"
+#define PREFIX_XOR	"xor(0)"
+#define USAGE		("securely XOR files to STDOUT\n" \
+				"Usage: %s FILE...\n")
+
+/* flags */
+
+#undef XOR_FLAG_LONGEST
+
+#define XOR_FLAG_LONGEST	0x1
 
 extern int	errno;
 void *(* volatile memshred)(void *, int, size_t) = &memset;
 
-/* return whether a file descriptor represents a FIFO-like inode */
-int
-isfifo(int fd)
-{
-	struct stat	st;
-
-	if (fstat(fd, &st)) {
-		return -errno;
-	}
-	return S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode);
-}
-
 void
 usage(const char *name);
 
+void
+help(const char *name)
+{
+	usage(name);
+	fprintf(stderr, "%s", HELP);
+}
+
 /* XOR files */
 int
-xor(int ofd, const int *ifds, size_t n);
+xor(int ofd, int flags, const int *ifds, size_t n);
 
 int
 main(int argc, const char **argv)
 {
+	int		c;
+	int		flags;
 	int		*ifds;
 	size_t		n;
 	size_t		opened;
+	const char	*path;
 	const char	*prefix;
 	int		retval;
 
+	flags = 0;
 	ifds = NULL;
-	n = argc - 1;
+	n = 0;
 	opened = 0;
+	prefix = NULL;
 	retval = 0;
+
+	/* parse arguments */
 
 	if (argc <= 1) {
 		usage(argv[0]);
 		retval = EXIT_FAILURE;
 		goto bubble;
 	}
+
+	for (c = 0; c >= 0; ) {
+		c = getopt(argc, (char **) argv, OPTSTRING);
+
+		switch (c) {
+		case -1:
+			break;
+		case ':':
+		case '?':
+			prefix = PREFIX_GETOPT;
+			retval = EXIT_FAILURE;
+			goto bubble;
+		case 'h':
+			help(argv[0]);
+			goto bubble;
+		case 'l':
+			flags |= XOR_FLAG_LONGEST;
+			break;
+		default:
+			prefix = PREFIX_GETOPT;
+			retval = EXIT_FAILURE;
+			goto bubble;
+		}
+	}
+	n = argc - optind;
 
 	/* open file descriptors */
 
@@ -103,7 +158,10 @@ main(int argc, const char **argv)
 	memset(ifds, -1, n);
 
 	for (; opened < n; opened++) {
-		ifds[opened] = open(argv[opened + 1], O_RDONLY);
+		path = argv[opened + optind];
+
+		ifds[opened] = strcmp(path, PATH_STDIN)
+			? open(argv[opened + optind], O_RDONLY) : STDIN_FILENO;
 
 		if (ifds[opened] < 0) {
 			prefix = PREFIX_OPEN;
@@ -115,16 +173,22 @@ main(int argc, const char **argv)
 	/* XOR */
 
 	prefix = PREFIX_XOR;
-	retval = xor(STDOUT_FILENO, ifds, n);
+	retval = xor(STDOUT_FILENO, flags, ifds, n);
 bubble:
 	/* close opened file descriptors */
 
-	for (; opened > 0; close(ifds[--opened]));
+	while (opened-- > 0) {
+		if (ifds[opened] != STDIN_FILENO) {
+			close(ifds[opened]);
+		}
+	}
 	free(ifds);
 
-	if (retval && retval < 0) {
+	if (retval < 0) {
 		errno = -retval;
 		perror(prefix);
+	} else if (retval && prefix != NULL) {
+		fprintf(stderr, "%s: error\n", prefix);
 	}
 	return retval;
 }
@@ -136,18 +200,19 @@ usage(const char *name)
 }
 
 int
-xor(int ofd, const int *ifds, size_t n)
+xor(int ofd, int flags, const int *ifds, size_t n)
 {
-	size_t		eofsleft;
-	size_t		i;
-	ssize_t		iobuflen;
+	size_t			eofsleft;
+	size_t			i;
+	ssize_t			iobuflen;
+	struct stat		istat;
 	struct xoristat {
-		uint8_t	hiteof;
-		uint8_t	isfifo;
-	}		*istats;
-	uint8_t		octet;
-	int		retval;
-	uint8_t		xored;
+		uint8_t		fifolike;
+		uint8_t		hiteof;
+	}			*istats;
+	uint8_t			octet;
+	int			retval;
+	uint8_t			xored;
 
 	retval = 0;
 
@@ -174,7 +239,12 @@ xor(int ofd, const int *ifds, size_t n)
 	istats = (struct xoristat *) calloc(1, n * sizeof(struct xoristat));
 
 	for (i = 0; i < n; i++) {
-		istats[0].isfifo = isfifo(ifds[0]);
+		if (fstat(ifds[i], &istat)) {
+			retval = -errno;
+			goto bubble;
+		}
+		istats[i].fifolike = !S_ISBLK(istat.st_mode)
+			&& !S_ISDIR(istat.st_mode) && !S_ISREG(istat.st_mode);
 	}
 
 	for (eofsleft = n; eofsleft > 0; ) {
@@ -187,11 +257,15 @@ xor(int ofd, const int *ifds, size_t n)
 
 			iobuflen = read(ifds[i], &octet, sizeof(octet));
 
-			if (iobuflen < 0 || istats[i].isfifo) {
+			if (iobuflen < 0 || istats[i].fifolike) {
 				retval = -errno;
 				goto bubble;
 			} else if (iobuflen) {
 				continue;
+			} else if (!iobuflen && !(flags & XOR_FLAG_LONGEST)) {
+				/* stop */
+
+				goto bubble;
 			}
 
 			/* EOF, and not FIFO-like: wrap around */
