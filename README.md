@@ -14,7 +14,7 @@ Well, what makes this tool different from the tons of others out there?  Easy:
 > pages from its address space, loss of cryptographic secrets is minimized.
 > This approach is hugely advantageous over trust-based alternatives, such as a
 > dedicated cryptographic coprocessor, or using a dedicated machine for
-> cryptographic purposes.
+> cryptographic purposes for the reason that **`xor` expects to be attacked**.
 
 Oh, and here's the full help text:
 ```
